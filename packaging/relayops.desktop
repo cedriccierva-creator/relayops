@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=RelayOps
+Comment=Start the RelayOps webhook dashboard and worker
+Exec="@LAUNCHER@" start
+Icon=@ICON@
+Terminal=false
+Categories=Development;
+StartupNotify=false

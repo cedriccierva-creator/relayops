@@ -1,0 +1,224 @@
+#!/usr/bin/python3
+"""Local desktop/service control; no application imports or database access."""
+import fcntl
+import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+
+ROOT = Path(__file__).resolve().parents[1]
+UNITS = tuple(f'relayops-{name}.service' for name in ('backend', 'frontend', 'worker'))
+BASE_PATH = '/usr/local/bin:/usr/bin:/bin'
+URL = 'http://127.0.0.1:3002'
+
+
+def ctl(*args, check=False):
+    result = subprocess.run(['/usr/bin/systemctl', '--user', *args], text=True, capture_output=True)
+    if check and result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+    return result
+
+
+def active(unit):
+    return ctl('is-active', '--quiet', unit).returncode == 0
+
+
+def quote(value):
+    # systemd specifiers and environment substitutions must remain literal paths.
+    return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%').replace('$', '$$') + '"'
+
+
+def node_path():
+    node = shutil.which('node')
+    if not node:
+        candidates = sorted((Path.home() / '.nvm/versions/node').glob('*/bin/node'),
+                            key=lambda p: tuple(int(x) for x in p.parents[1].name.lstrip('v').split('.')))
+        node = str(candidates[-1]) if candidates else None
+    if not node or not Path(node).is_file():
+        raise RuntimeError('Node not found. Run install from a shell with your existing Node on PATH.')
+    return Path(node).resolve()
+
+
+def install():
+    if any(active(unit) for unit in UNITS):
+        raise RuntimeError('Stop launcher-managed RelayOps services before reinstalling.')
+    node = node_path()
+    python = ROOT / 'backend/.venv/bin/python'
+    next_cli = ROOT / 'frontend/node_modules/next/dist/bin/next'
+    for path in (python, next_cli):
+        if not path.is_file():
+            raise RuntimeError(f'Missing existing dependency: {path}; follow README setup first.')
+    config = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'systemd/user'
+    apps = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share')) / 'applications'
+    config.mkdir(parents=True, exist_ok=True)
+    apps.mkdir(parents=True, exist_ok=True)
+    commands = (
+        [python, '-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', '8001', '--no-access-log'],
+        [node, next_cli, 'start' if (ROOT / 'frontend/.next/BUILD_ID').is_file() else 'dev',
+         '--hostname', '127.0.0.1', '--port', '3002'],
+        [python, 'worker.py'],
+    )
+    for unit, command, directory in zip(UNITS, commands, ('backend', 'frontend', 'backend')):
+        content = ('[Unit]\nDescription=RelayOps ' + directory + ' (' + unit + ')\n'
+                   '[Service]\nType=exec\nWorkingDirectory=' + str(ROOT / directory).replace('\\', r'\x5c').replace(' ', r'\x20').replace('%', '%%') + '\n'
+                   'Environment="PATH=' + str(node.parent).replace('%', '%%') + ':' + BASE_PATH + '"\n'
+                   'Environment=RELAYOPS_API_PORT=8001\n'
+                   'Environment=PYTHONUNBUFFERED=1\n'
+                   'Environment=NEXT_TELEMETRY_DISABLED=1\n'
+                   'Environment=\'DASHBOARD_ORIGINS=["http://localhost:3002","http://127.0.0.1:3002"]\'\n'
+                   'ExecStart=' + ' '.join(quote(x) for x in command) + '\n'
+                   'Restart=no\nTimeoutStopSec=90\nStandardOutput=journal\nStandardError=journal\n')
+        target = config / unit
+        if target.exists() and target.read_text() != content:
+            raise RuntimeError(f'Existing unit differs: {target}. Review it before replacing.')
+        target.write_text(content)
+    desktop = (ROOT / 'packaging/relayops.desktop').read_text()
+    # Desktop Exec quoting differs from systemd quoting.
+    executable = str(ROOT / 'scripts/relayops').replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$').replace('%', '%%')
+    desktop = desktop.replace('@LAUNCHER@', executable).replace('@ICON@', str(ROOT / 'frontend/src/app/icon.svg'))
+    (apps / 'relayops.desktop').write_text(desktop)
+    ctl('daemon-reload', check=True)
+    print('Installed RelayOps menu entry and user units. No services started or enabled.')
+
+
+def port_free(port):
+    with socket.socket() as sock:
+        try:
+            sock.bind(('127.0.0.1', port))
+        except OSError:
+            return False
+    return True
+
+
+def healthy(url):
+    try:
+        request = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with request.open(url, timeout=1) as response:
+            return response.status == 200
+    except OSError:
+        return False
+
+
+def open_dashboard():
+    # main() holds the launcher lock, so rapid menu clicks share this debounce.
+    runtime = os.environ.get('XDG_RUNTIME_DIR')
+    stamp = Path(runtime) / 'relayops-browser-opened' if runtime else None
+    if stamp:
+        try:
+            opened = float(stamp.read_text())
+            age = time.monotonic() - opened
+            if 0 <= age < 5:
+                return
+        except (OSError, ValueError):
+            pass
+    flatpak = shutil.which('flatpak', path=BASE_PATH)
+    commands = []
+    if flatpak:
+        try:
+            available = subprocess.run([flatpak, 'info', 'com.google.Chrome'],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                       timeout=5).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            available = False
+        if available:
+            commands.append([flatpak, 'run', 'com.google.Chrome', f'--app={URL}'])
+    commands.append(['/usr/bin/xdg-open', URL])
+    for command in commands:
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+            try:
+                if process.wait(timeout=1) != 0:
+                    continue
+            except subprocess.TimeoutExpired:
+                pass  # Browser remains running; do not wait for its window to close.
+        except OSError:
+            continue
+        if stamp:
+            try:
+                stamp.write_text(str(time.monotonic()))
+            except OSError:
+                pass  # A browser already opened; state failure must not open another.
+        return
+    raise RuntimeError('Could not open dashboard with Chrome Flatpak or the default browser.')
+
+
+def start():
+    for unit in UNITS:
+        if ctl('show', '--property=LoadState', '--value', unit).stdout.strip() != 'loaded':
+            raise RuntimeError('Run scripts/relayops install first.')
+    # Check every unmanaged listener before starting anything. Never adopt a process.
+    for unit, port in zip(UNITS[:2], (8001, 3002)):
+        if not active(unit) and not port_free(port):
+            raise RuntimeError(f'Port {port} is occupied outside {unit}; no processes were stopped.')
+    started = []
+    try:
+        for unit in UNITS[:2]:
+            if not active(unit):
+                ctl('start', unit, check=True)
+                started.append(unit)
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            if not all(active(unit) for unit in UNITS[:2]):
+                raise RuntimeError('A RelayOps service exited; use scripts/relayops logs.')
+            if healthy('http://127.0.0.1:8001/api/health') and healthy('http://127.0.0.1:3002'):
+                break
+            time.sleep(.5)
+        else:
+            raise RuntimeError('Readiness timed out; use scripts/relayops logs.')
+        if not active(UNITS[2]):
+            ctl('start', UNITS[2], check=True)
+            started.append(UNITS[2])
+        time.sleep(.5)
+        if not active(UNITS[2]):
+            raise RuntimeError('Worker exited (possibly another worker holds its lock); inspect logs.')
+    except Exception:
+        for unit in reversed(started):
+            ctl('stop', unit)
+        raise
+    open_dashboard()
+    print(f'RelayOps ready: {URL}')
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) == 2 else 'start' if len(sys.argv) == 1 else ''
+    if action not in ('install', 'start', 'stop', 'status', 'logs'):
+        print('Usage: scripts/relayops [install|start|stop|status|logs]', file=sys.stderr)
+        return 2
+    try:
+        runtime = os.environ.get('XDG_RUNTIME_DIR')
+        if not runtime or not Path(runtime).is_dir():
+            raise RuntimeError('No user runtime directory. Run in a logged-in desktop session.')
+        with (Path(runtime) / 'relayops-launcher.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError('Another RelayOps launcher operation is in progress.')
+            ctl('show-environment', check=True)
+            if action == 'install':
+                install()
+            elif action == 'start':
+                start()
+            elif action == 'stop':
+                ctl('stop', *reversed(UNITS), check=True)
+            elif action == 'status':
+                return subprocess.run(['/usr/bin/systemctl', '--user', '--no-pager', 'status', *UNITS]).returncode
+            else:
+                return subprocess.run(['/usr/bin/journalctl', '--user', '--no-pager', '-n', '100',
+                                       *[arg for unit in UNITS for arg in ('-u', unit)]]).returncode
+        return 0
+    except (OSError, RuntimeError) as exc:
+        message = f'RelayOps: {exc}'
+        print(message, file=sys.stderr)
+        notify = shutil.which('notify-send', path=BASE_PATH)
+        if notify:
+            subprocess.run([notify, 'RelayOps launcher', message], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

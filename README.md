@@ -97,6 +97,10 @@ For a production frontend build, run `npm run build` and `npm run start` from
 `frontend/`. `npm run build -- --webpack` is an alternative for constrained build
 environments. Keep the backend on loopback behind an HTTPS reverse proxy.
 
+For an optional one-click Linux application-menu launcher on ports 8001/3002,
+see [desktop launcher setup](scripts/README-launcher.md). It uses user systemd
+services and existing dependencies.
+
 ## Send your first event
 
 1. Sign in and create a **Source** with a high-entropy secret of 32–256 characters.
