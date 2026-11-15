@@ -1,0 +1,55 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+node_modules/
+.next/
+*.db
+*.sqlite3
+backend/data/
+.pytest_cache/
+*.log
+
+# Additional local environments, caches and environment variants
+venv/
+.virtualenv/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.tsbuildinfo
+.env.*
+!.env.example
+!.env.*.example
+
+# Local backup environments and dependency copies
+.venv.*/
+venv.*/
+.virtualenv.*/
+node_modules.*/
+
+# SQLite files, journals and worker locks (including custom database paths)
+*.sqlite
+*.db-*
+*.sqlite-*
+*.sqlite3-*
+*.worker.lock
+
+# Local backups, editor leftovers and runtime output
+*.bak
+*.backup
+*.old
+*~
+*.swp
+*.swo
+backups/
+logs/
+.pids/
+*.pid
+.DS_Store
+
+# Historical local development material, preserved outside the publication tree
+/PHASE*_REPORT.md
+/scripts/study-sprint
+/packaging/n8n-study-sprint.desktop
+/frontend/src/components/study-widget.tsx
